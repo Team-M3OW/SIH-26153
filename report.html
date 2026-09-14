@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A World Model for Predictive Cyber Defence</title>
+<style>
+@page { size: A4; margin: 25mm 20mm; }
+* { box-sizing: border-box; }
+body {
+  font-family: "Georgia", "Times New Roman", serif;
+  font-size: 10.8pt; line-height: 1.5; color: #111;
+  max-width: 780px; margin: 0 auto; padding: 20px;
+}
+h1.title { font-size: 20pt; text-align: center; margin-bottom: 2px; }
+p.subtitle { text-align: center; font-size: 12.5pt; font-style: italic; color: #333; margin-top: 0; }
+p.byline { text-align: center; font-size: 10.5pt; color: #444; margin: 4px 0 30px; }
+.abstract { background: #f7f6f2; border: 1px solid #ddd8cc; padding: 14px 18px; margin: 20px 0 30px; font-size: 10pt; }
+.abstract .label { font-weight: bold; font-variant: small-caps; display:block; margin-bottom:6px; }
+h2 { font-size: 14.5pt; border-bottom: 1.3px solid #222; padding-bottom: 3px; margin-top: 34px; page-break-after: avoid; }
+h3 { font-size: 12pt; margin-top: 22px; page-break-after: avoid; }
+h4 { font-size: 10.8pt; font-style: italic; margin-top: 16px; margin-bottom: 4px; }
+p { margin: 8px 0; text-align: justify; }
+code { font-family: "Courier New", monospace; font-size: 9.6pt; background: #f1efe8; padding: 0 2px; border-radius: 2px; }
+table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 9.3pt; }
+caption { font-size: 9.3pt; font-weight: bold; text-align: left; margin-bottom: 4px; caption-side: top; }
+th, td { padding: 4px 8px; text-align: center; border-bottom: 0.7px solid #ccc; }
+thead th { border-bottom: 1.3px solid #222; border-top: 1.3px solid #222; font-weight: bold; }
+tbody tr:last-child td { border-bottom: 1.3px solid #222; }
+td.label, th.label { text-align: left; }
+.good { color: #1a6b1a; font-weight: 600; }
+.bad { color: #a3251f; font-weight: 600; }
+ul, ol { margin: 6px 0; padding-left: 22px; }
+li { margin: 3px 0; text-align: justify; }
+dl.desc dt { font-weight: bold; margin-top: 10px; }
+dl.desc dd { margin: 4px 0 4px 0; text-align: justify; }
+.footnote { font-size: 8.8pt; color: #555; }
+.toc { margin: 20px 0 30px; font-size: 10pt; }
+.toc ol { padding-left: 20px; }
+.toc a { color: #111; text-decoration: none; }
+section { page-break-before: auto; }
+</style>
+</head>
+<body>
+
+<h1 class="title">A World Model for Predictive Cyber Defence</h1>
+<p class="subtitle">Learning Network State Dynamics to Forecast Attacker Progression</p>
+<p class="byline">SIH26153 &mdash; Technical Report</p>
+
+<div class="abstract">
+<span class="label">Abstract</span>
+This report documents the design, architecture search, and evaluation of a self-supervised
+latent-transition model that learns from flow-level network telemetry and forecasts an
+attacker's progression through a 7-stage MITRE ATT&amp;CK-derived taxonomy. The system is
+trained on three public intrusion-detection datasets (CIC-IDS-2018, CIC-IDS-2017, CTU-13)
+pooled into one 43-feature, 60-second-windowed representation, and evaluated with two
+supervised downstream heads: (i) binary infiltration-probability forecasting 1&ndash;5 minutes
+ahead, and (ii) 7-way stage classification. <b>The result that should be read as primary is a
+cross-episode holdout</b>: training on one of CIC-IDS-2018's two Infiltration episodes and
+testing purely on the other (never mixed) gives AUC &asymp; 0.68&ndash;0.82 &mdash; a real,
+above-chance, but modest generalization result, based on only the two such episodes the
+dataset contains. The commonly quoted pooled/in-distribution numbers (AUC &asymp;
+0.97&ndash;0.98, obtained by training and testing on different time-windows of the <i>same</i>
+episodes) are reported for completeness and cross-architecture comparison only and should
+<b>not</b> be read as a generalization claim, since they can and likely do partly reflect
+episode-specific persistence rather than transferable signal. Roughly a dozen architectural
+variants were compared, including a Transformer-based model, a Recurrent State-Space Model
+(RSSM), domain-adversarial training, two independent graph-structured encoders, and a
+KL-bottleneck ablation. The strongest, seed-replicated configuration is an RSSM with an
+unfrozen encoder; unfreezing is shown here to improve the two <i>downstream
+classification/forecast heads</i> measured, which is a narrower claim than an improvement in
+the underlying latent dynamics themselves &mdash; this report's evaluation is centered on those
+two task heads (Section&nbsp;3.4 states this boundary explicitly) and does not separately
+measure open-loop multi-step reconstruction error, future communication-graph structure, or
+other direct measures of world-model quality. Several stage classes have too few test
+occurrences to support a confident per-class claim (zero Reconnaissance/Exfiltration
+occurrences, 5&ndash;17 Lateral-Movement/Initial-Access/Impact occurrences at any forecast
+horizon); this is stated plainly rather than smoothed into the headline numbers. The system
+includes a SHAP-based explanation of single-window stage predictions (not of a full multi-step
+rollout &mdash; a narrower claim, stated explicitly in Section&nbsp;7) and a working
+live-inference prototype (Flask backend + browser dashboard) accepting a CSV or raw PCAP file.
+</div>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+<li>Problem Framing</li>
+<li>Data and Feature Engineering</li>
+<li>Core Architecture</li>
+<li>Architecture Search</li>
+<li>Per-Stage Forecasting Results</li>
+<li>Baselines and the Cross-Episode Generalization Test</li>
+<li>Explainability</li>
+<li>Working Prototype</li>
+<li>Known Limitations</li>
+<li>Conclusion</li>
+</ol>
+<p style="margin-top:8px">Reproducibility &middot; References (unnumbered, end of document)</p>
+</div>
+
+<section>
+<h2>1. Problem Framing</h2>
+<p>The problem statement (SIH26153) asks for a system that learns network state dynamics from
+traffic telemetry, forecasts attacker progression, maps predictions onto MITRE ATT&amp;CK stages,
+and exposes interpretable decision support &mdash; explicitly favouring a <i>world model</i>
+(P(S<sub>t+1</sub> | S<sub>t</sub>), a model of how the network evolves) over a static classifier
+that only labels the present. Two properties of the task shaped every subsequent design decision:</p>
+<ul>
+<li><b>Forecasting, not detection.</b> The deliverable is a probability of reaching a dangerous
+stage k steps into the future, not a same-timestep label. This rules out any architecture that
+only classifies the current window and pushes toward genuinely sequential models.</li>
+<li><b>Interpretability is mandatory, not optional.</b> Both an attention/attribution channel
+(SHAP) and a closed-form, whiteboard-showable mechanism (a counted stage-transition matrix,
+&Pi;) are required outputs, not an afterthought bolted on at the end.</li>
+</ul>
+</section>
+
+<section>
+<h2>2. Data and Feature Engineering</h2>
+<h3>2.1 Datasets</h3>
+<p><b>Provenance, stated precisely to avoid any ambiguity:</b> training used each dataset's
+already-flow-level export &mdash; CICFlowMeter's per-flow CSV output for CIC-IDS-2018/2017, and
+Argus's per-flow <code>binetflow</code> export for CTU-13 &mdash; re-aggregated by us from
+per-flow rows into a common 60-second-window schema. <b>No raw packet capture (PCAP) was
+processed for any of the three training datasets</b>; the public CIC-IDS-2018/2017 PCAP release
+is ~220&nbsp;GB and was not downloaded (Section&nbsp;9). The only component of this project that
+parses raw packets is the live-inference demo path (Section&nbsp;8), which is separate from
+training and operates on user-supplied PCAP/CSV input at inference time only.</p>
+<ul>
+<li><b>CIC-IDS-2018</b> (10 days, CICFlowMeter output) &mdash; the primary source; carries
+Reconnaissance, Initial Access, Lateral Movement, Command &amp; Control, and Impact-stage
+attacks. No IP columns in the public release, which later blocked any host-communication graph
+representation for this dataset specifically.</li>
+<li><b>CIC-IDS-2017</b> (8 days, <code>GeneratedLabelledFlows</code> release) &mdash; folded into
+training on explicit instruction; retains real <code>Source IP</code>/<code>Destination IP</code>
+columns, unlike CIC-IDS-2018.</li>
+<li><b>CTU-13</b> (13 scenarios, Argus binetflow) &mdash; 13 independent real botnet captures
+(Neris, Rbot, Virut, Murlo, Sogou, and others), contributing mainly Benign/Command-and-Control
+labels; also carries real <code>SrcAddr</code>/<code>DstAddr</code> and real TTL.</li>
+</ul>
+<p>Two datasets suggested by the problem statement were evaluated and <b>not</b> integrated, for
+stated, verified reasons (Section&nbsp;9): CICIoT2023 (no timestamps, packets pre-shuffled into
+fixed-size groups &mdash; structurally incompatible with sequence forecasting) and raw PCAP-level
+capture for CIC-IDS-2018/2017 (the public PCAP release is ~220&nbsp;GB, judged not worth the
+bandwidth/storage cost for the marginal features gained over the flow-level CSVs).</p>
+
+<h3>2.2 Stage-label mapping: provenance and scope</h3>
+<p>None of the three datasets ships native MITRE ATT&amp;CK labels. The 7-stage taxonomy used
+throughout this report (Benign, Reconnaissance, Initial Access, Lateral Movement, Command and
+Control, Exfiltration, Impact) is obtained by keyword-matching each dataset's own native
+attack-type label string (e.g. &ldquo;DDoS attacks-LOIC-HTTP&rdquo;, &ldquo;Infilteration&rdquo;,
+&ldquo;PortScan&rdquo;) against a fixed, first-match-wins rule table (reproduced in full below),
+then assigning that single stage label to every flow in the window and taking the majority
+label as the window's stage. This mapping is a <b>first-class, reviewable modelling decision,
+not native ground truth</b>, and two consequences follow directly from that:</p>
+<ul>
+<li><b>The 7 stages are treated as one label per window, in a fixed evaluation order</b> &mdash;
+real MITRE ATT&amp;CK techniques and tactics can co-occur, repeat, and branch, and this project
+does not claim otherwise. The single-label-per-window taxonomy is an evaluation simplification
+chosen because the source datasets carry a single attack-type string per flow in the first
+place; it is not a modelling claim that real attacker behaviour is linear.</li>
+<li><b>Two mapping decisions are judgment calls, stated here rather than left implicit in
+code</b>: CIC-IDS-2018's &ldquo;Infilteration&rdquo; label (its multi-phase
+exploit-delivery-plus-internal-portscan scenario) is mapped to <i>Lateral Movement</i> rather
+than <i>Initial Access</i>, on the basis that the labeled traffic is the attacker already inside
+and moving through the network; and CTU-13's &ldquo;Background&rdquo; traffic (unconfirmed
+ambient traffic, not attested as either attack or known-good) is mapped to <i>Benign</i> because
+it is not confirmed malicious, not because it is confirmed clean.</li>
+</ul>
+<table>
+<caption>The full first-match-wins keyword table (attack_map.py).</caption>
+<thead><tr><th class="label">Keyword (case-insensitive substring)</th><th class="label">Stage</th></tr></thead>
+<tbody>
+<tr><td class="label">benign, normal, background</td><td class="label">Benign</td></tr>
+<tr><td class="label">portscan, port scan, recon</td><td class="label">Reconnaissance</td></tr>
+<tr><td class="label">bruteforce, brute force, patator, sql injection, xss, web attack</td><td class="label">Initial Access</td></tr>
+<tr><td class="label">infilt, heartbleed</td><td class="label">Lateral Movement</td></tr>
+<tr><td class="label">bot, botnet</td><td class="label">Command and Control</td></tr>
+<tr><td class="label">exfil</td><td class="label">Exfiltration</td></tr>
+<tr><td class="label">ddos, dos(-/_/space), goldeneye, slowloris, slowhttptest, hulk</td><td class="label">Impact</td></tr>
+</tbody>
+</table>
+<p>An unrecognized non-benign label raises an error at preprocessing time rather than silently
+defaulting to Benign (<code>attack_map.py</code>'s <code>stage_idx_for_label</code>) &mdash;
+every label that entered training is accounted for in this table, none were dropped silently.
+The &Pi; transition matrix (Section&nbsp;3.1) is counted directly over this same per-window
+single-stage label sequence; it should be read as a baseline/explanation aid over that
+simplified label stream, <b>not as a claim about ATT&amp;CK's real non-linear structure</b>.</p>
+
+<h3>2.3 Feature schema</h3>
+<p>Each 60-second window is reduced to a flat 43-dimensional vector: flow volume/rate statistics,
+TCP flag rates, protocol shares, destination-port structure (entropy, well-known-service shares,
+distinct-port fraction &mdash; the scan signature), connection-shape signals (one-way/zero-byte
+fractions), and packet-level slots (TTL, fragmentation, retransmission, payload-size variance)
+&mdash; populated with real values where the source dataset supports it (CTU-13's real TTL) and
+zero-filled with an explicit flag otherwise (CIC-IDS-2018/2017's flow-CSV-only public release).
+No IP or port identity is ever fed to the model as a feature, only used as an aggregation key
+&mdash; a deliberate guard against the model memorizing &ldquo;this IP is the attacker&rdquo;
+instead of learning a transferable traffic signature.</p>
+<h4>The log1p fix</h4>
+<p>Heavy-tailed count/volume columns (flow count, byte/packet means) span orders of magnitude
+&mdash; a benign window might see n_flows &asymp; 1,300 while a DDoS window reaches n_flows
+&asymp; 275,000. Naive robust (median/IQR) scaling alone clips anything past &plusmn;8 IQR-units
+to one identical saturated value, which erases exactly the signal that should most clearly mark
+an Impact-stage window. Applying log(1+x) before scaling compresses this range without destroying
+relative ordering. This was a concrete, verified bug fix, not a hypothetical concern:
+Impact-stage detection was materially better after the fix.</p>
+</section>
+
+<section>
+<h2>3. Core Architecture</h2>
+<h3>3.1 Two-phase design</h3>
+<ol>
+<li><b>Phase 1 &mdash; self-supervised dynamics.</b> An encoder maps the 43-dim window to a
+latent z<sub>t</sub>; a transition model produces a distribution N(&mu;,&sigma;&sup2;) over
+z<sub>t+1</sub> (never a point estimate); a decoder reconstructs &Scirc;<sub>t+1</sub>. Trained
+purely on Gaussian negative log-likelihood of the real next window, with <b>no label ever
+touched</b>.</li>
+<li><b>Phase 2 &mdash; supervised heads.</b> With the Phase-1 backbone optionally frozen
+(Section&nbsp;4.4 covers when it should not be), a linear <code>StageHead</code> (7-way MITRE
+classification) and <code>InfilHead</code> (binary infiltration probability) are trained on top,
+plus a Laplace-smoothed, counted stage-transition matrix &Pi; (never gradient-trained) for a
+cheap, interpretable closed-form forecast check: &gamma;&#770;<sub>t+K</sub> = (&Pi;<sup>&top;</sup>)<sup>K</sup>&gamma;<sub>t</sub>.</li>
+</ol>
+
+<h3>3.2 The multi-step training fix</h3>
+<p>The dynamics loss is scored two ways, <b>concatenated</b> into one loss rather than weighted
+against each other:</p>
+<ul>
+<li>one-step, teacher-forced: real z<sub>&le;t</sub> in, score z<sub>t+1</sub> against reality, at
+every position;</li>
+<li>multi-step, open-loop: encode only the context, roll the transition forward <i>consuming
+nothing but its own sampled output</i>, decode each imagined step, score against the real future
+observations.</li>
+</ul>
+<p>Training on the one-step term alone never teaches the model to stay accurate over an open-loop
+rollout &mdash; it only ever sees real history during training, then is asked to imagine chains
+of its own predictions at inference. Adding the multi-step term (this is what &ldquo;latent
+overshooting&rdquo; means in the RSSM literature) closed nearly the entire real-vs-imagined
+accuracy gap for the two best-supported classes (Benign, Command &amp; Control), while correctly
+leaving the three data-scarce classes untouched &mdash; confirming this was a training-regime
+fix, not a data-volume fix.</p>
+
+<h3>3.3 Infiltration probability is derived, not a dedicated head</h3>
+<p>Infiltration probability is the stage-classifier's own softmax mass on {Lateral Movement,
+Command &amp; Control, Exfiltration}, not a separately-trained head. A dedicated
+<code>InfilHead</code> was built and tested twice, under two different class-weighting schemes,
+and was <b>consistently worse</b> than the derived approach both times &mdash; a clean, confirmed
+negative result, reported honestly rather than buried.</p>
+
+<h3>3.4 Evaluation scope: what is, and is not, measured</h3>
+<p>Every result in Sections&nbsp;4&ndash;5 is a measurement of the <b>two downstream heads</b>
+(<code>StageHead</code>, <code>InfilHead</code>) built on top of the Phase-1 latent, not of the
+Phase-1 dynamics model in isolation. This distinction matters because a change that improves
+those heads &mdash; most notably unfreezing the encoder (Section&nbsp;4.4) &mdash; is not
+automatically evidence that the underlying <i>learned network dynamics</i> improved; it may
+equally mean the representation was pulled toward whatever the classification/forecasting
+objective rewards, at some unmeasured cost to the dynamics model's own quality. Three concrete
+gaps follow from this, stated explicitly rather than left implicit:</p>
+<ul>
+<li><b>No separate open-loop multi-step reconstruction metric is reported.</b> The multi-step
+training loss (Section&nbsp;3.2) trains against exactly this quantity &mdash; Gaussian NLL of
+the decoder's imagined rollout against the real future window &mdash; but this report surfaces
+only the downstream Brier/AUC/F1 built on top of that latent, never the raw per-feature
+reconstruction error itself, frozen vs. unfrozen, side by side.</li>
+<li><b>No future communication-structure/graph-level prediction is evaluated.</b> The two
+graph-structured encoder variants (Section&nbsp;4.2) are evaluated only through the same two
+downstream heads as every other variant; neither this report nor the underlying project
+measures whether either graph encoder's own predicted future edge structure matches the real
+future communication pattern.</li>
+<li><b>SHAP explains one window's classification, not a multi-step forecast rollout</b>
+(Section&nbsp;7 states this boundary explicitly).</li>
+</ul>
+<p>The system therefore supports a <b>narrower, more defensible claim</b> than &ldquo;the world
+model's dynamics improved&rdquo;: it supports &ldquo;the latent representation, combined with
+two supervised heads, produces a useful forecast and classification signal, whose quality is
+measured directly; whether the <i>unsupervised dynamics model in isolation</i> improved is not
+separately established here.&rdquo; Readers should treat every comparison in Section&nbsp;4
+under that scope.</p>
+</section>
+
+<section>
+<h2>4. Architecture Search</h2>
+<p>Roughly a dozen variants were built and evaluated on identical splits, using two metrics
+throughout: <b>Brier score</b> (mean squared error of the predicted probability against the
+binary outcome &mdash; calibration) and <b>AUC</b> (probability a random true positive outranks
+a random true negative &mdash; ranking quality, ignoring calibration; 0.5 is random, below 0.5
+is <i>worse</i> than random). Table 1 summarizes every architecture on pooled metrics; per-domain
+and per-class detail follows.</p>
+
+<table>
+<caption>Table 1. Every architecture tried, pooled ("all domains") metrics, neural method.</caption>
+<thead><tr><th class="label">Architecture</th><th>Brier (k1&rarr;5)</th><th>AUC (k1&rarr;5)</th><th>macroF1 (real/imag.)</th></tr></thead>
+<tbody>
+<tr><td class="label">Baseline Transformer (frozen)</td><td>0.140 &rarr; 0.128</td><td>0.913 &rarr; 0.911</td><td>0.376 / 0.302</td></tr>
+<tr><td class="label">RSSM, plain (frozen)</td><td>0.169 &rarr; 0.174</td><td>0.931 &rarr; 0.909</td><td>0.329 / 0.273</td></tr>
+<tr><td class="label">RSSM + domain-adversarial (frozen)</td><td>0.188 &rarr; 0.188</td><td>0.927 &rarr; 0.912</td><td>0.295 / 0.327</td></tr>
+<tr><td class="label">RSSM + feature-graph encoder (frozen)</td><td>0.124 &rarr; 0.141</td><td>0.955 &rarr; 0.931</td><td>0.386 / 0.306</td></tr>
+<tr><td class="label">KL-bottleneck-on-Transformer ablation</td><td>0.126 &rarr; 0.098</td><td>0.935 &rarr; 0.939</td><td>0.205 / 0.337</td></tr>
+<tr><td class="label"><b>RSSM, encoder unfrozen</b></td><td><b>0.054 &rarr; 0.061</b></td><td><b>0.982 &rarr; 0.968</b></td><td><b>0.521 / 0.467</b></td></tr>
+<tr><td class="label">RSSM unfrozen + DANN (seed 1)</td><td>0.048 &rarr; 0.058</td><td>0.983 &rarr; 0.977</td><td>0.519 / 0.556</td></tr>
+<tr><td class="label">RSSM unfrozen + DANN (seed 2)</td><td>0.050 &rarr; 0.052</td><td>0.976 &rarr; 0.967</td><td>0.671 / 0.437</td></tr>
+<tr><td class="label">G-RSSM (host-graph, 2 of 3 domains)</td><td>0.174 &rarr; 0.181</td><td>0.775 &rarr; 0.765</td><td>0.418 / 0.469&dagger;</td></tr>
+</tbody>
+</table>
+<p class="footnote">&dagger; Evaluated on a 3-of-7-class test set (only CTU-13 and CIC-IDS-2017,
+which lack several stages in their test slices) &mdash; not directly comparable to the 6-class
+pooled numbers above.</p>
+
+<h3>4.1 Domain-adversarial training (DANN)</h3>
+<p>Pooling three genuinely different network environments causes a real, measured failure:
+without correction, the stage classifier and &Pi; work well on whichever domain dominates
+training and are actively worse than random on the others. DANN adds a small domain classifier
+trained <i>adversarially</i> against the shared encoder via a Gradient Reversal Layer (GRL): the
+domain head itself gets better at guessing which dataset a window came from, while the encoder
+underneath receives the <i>negated</i> gradient, pushed to make that guess harder. On the plain
+Transformer this helped the worst domain (CIC-IDS-2017) but hurt the previously-best one
+(CTU-13) &mdash; a genuine trade-off, not a clean win.</p>
+
+<h3>4.2 Two independent graph-structured encoders</h3>
+<p>Two structurally different graph ideas were tried, with markedly different outcomes:</p>
+<dl class="desc">
+<dt>Feature-level graph (GraFT-inspired)</dt>
+<dd>Nodes are the 43 <i>features themselves</i> (not network hosts); edges are (a) fixed
+domain-knowledge groupings (e.g. all TCP-flag features connected to each other) and (b)
+per-window dynamic top-k cosine-similarity edges. A relational GCN with per-relation-type
+weights replaces the flat MLP encoder. Combined with the Transformer, this was <b>unstable</b>
+across epoch counts (AUC swinging from &asymp;0.5 to &asymp;0.07 between 30- and 80-epoch runs
+on CIC-IDS-2017) &mdash; consistent with the literature on GNN oversmoothing/initialization
+sensitivity, and reverted. Combined with RSSM instead, it was one of the <b>best</b> results of
+the whole project (best pooled AUC of any frozen variant, best frozen-model classification F1)
+&mdash; the instability was tied to the Transformer's own attention-based transition competing
+with a second attention mechanism inside the encoder, not an inherent flaw of the graph idea.</dd>
+<dt>Host-communication graph (G-RSSM, arXiv:2604.14811)</dt>
+<dd>Nodes are actual network hosts (IP addresses); edges are observed communication within a
+60-second window; a per-host GRU plus masked cross-host attention replaces the flat encoder
+entirely. Only CTU-13 and CIC-IDS-2017 carry host identity (CIC-IDS-2018's public CSVs do not),
+so this variant covers two of three domains. The first implementation produced forecasts
+<i>systematically anti-correlated</i> with ground truth (AUC 0.13&ndash;0.30, below random)
+&mdash; traced to a real, identifiable bug: the top-16 hosts selected for each window were
+re-chosen <i>independently per window</i>, so a given &ldquo;node slot&rdquo; silently referred
+to a different physical host from one minute to the next, making the per-host recurrence
+meaningless. Fixing this (a day-level fixed host roster, one consistent slot per host for the
+whole day) genuinely repaired CIC-IDS-2017 forecasting (AUC 0.14&rarr;0.58, &Pi;-check reaching
+0.85) but left CTU-13 still broken (AUC 0.20&ndash;0.31) &mdash; a second, distinct, unresolved
+issue (likely that CTU-13's low-volume botnet hosts never make a naive top-16-by-volume cut).</dd>
+</dl>
+
+<h3>4.3 The KL-bottleneck ablation: why does RSSM beat the Transformer?</h3>
+<p>RSSM's advantage over the Transformer could come from at least two different mechanisms: its
+GRU recurrence/smaller parameter count, or its stochastic posterior/prior plus free-bits KL
+regularization (the &ldquo;bottleneck&rdquo;). To isolate this, a small posterior head was added
+<i>on top of the otherwise-unchanged Transformer</i> &mdash; same backbone, same parameter
+count, no GRU &mdash; trained with DreamerV3's exact balanced free-bits KL against the
+Transformer's own prior. Result: the KL-bottleneck alone improved pooled Brier/AUC over the plain
+Transformer and won outright on CTU-13, but did <b>not</b> reproduce RSSM's CIC-IDS-2017 strength
+&mdash; so the GRU/recurrence itself (or seed variance) explains that specific domain's result,
+not the KL mechanism alone. The hypothesis splits cleanly rather than resolving to one cause.</p>
+
+<h3>4.4 Encoder freezing: the real bottleneck for classification</h3>
+<p>Every architecture above trains its <code>StageHead</code> on a <b>frozen</b> Phase-1
+encoder &mdash; shaped only by the label-blind dynamics loss. A raw-feature logistic regression
+proved the seven stages are linearly separable in the 43-dim input space (one-vs-rest AUC
+0.90&ndash;0.999, including Reconnaissance with only 12 training examples, and Initial Access at
+0.999), yet every frozen architecture scored &le;0.402 F1 on Initial Access and 0.000 on it for
+most variants. The mechanism: a frozen, label-blind encoder has no incentive to preserve a rare
+event's distinguishing detail if it barely moves the averaged dynamics loss &mdash; exactly the
+rate-distortion trade-off that makes rare, &ldquo;surprising&rdquo; states the most expensive
+thing a KL-regularized latent can encode faithfully.</p>
+<p><b>Unfreezing the encoder</b> for Phase 2 (letting the classification/infiltration gradient
+flow back into it) confirmed this decisively: macroF1 jumped 0.329&rarr;0.521, infiltration
+Brier improved roughly 3&times;, Initial Access F1 went from <span class="bad">0.000</span> to
+<span class="good">0.402</span>, Impact from <span class="bad">0.208</span> to
+<span class="good">0.628</span>. The cost: RSSM's own CIC-IDS-2017 domain-generalization
+strength partially collapsed (AUC 0.87&rarr;0.65), because fine-tuning on labels pulls the
+representation toward whatever the label-heavy domains need. Combining unfreezing with DANN
+recovered most of that loss on one seed (AUC up to 0.83) but the recovery <b>did not
+replicate</b> on a second seed (Section&nbsp;4.5).</p>
+
+<h3>4.5 Seed variance: the discipline that mattered most</h3>
+<p>RSSM showed large run-to-run variance throughout this project. Two seeds of the same
+&ldquo;unfrozen + DANN&rdquo; configuration gave opposite answers to the specific question
+&ldquo;does DANN recover RSSM's lost CIC-IDS-2017 strength&rdquo;: seed 1 said yes (AUC
+0.73&rarr;0.83), seed 2 said no (AUC 0.19&rarr;0.30, worse than a coin flip at k=1). Everything
+else about that configuration &mdash; pooled metrics, CIC-IDS-2018, CTU-13, classification F1
+&mdash; replicated closely across both seeds. The honest conclusion: unfreezing and the general
+RSSM architecture are solid, replicated findings; the specific claim that DANN reliably rescues
+CIC-IDS-2017 domain generalization is <b>not established</b> and should not be reported as a
+settled result.</p>
+</section>
+
+<section>
+<h2>5. Per-Stage Forecasting Results</h2>
+<p>Binary infiltration forecasting collapses the full 7-way stage distribution into one number
+(probability mass on the three post-compromise stages) because it is the decision-relevant
+question for an operator (&ldquo;will this become a serious breach&rdquo;) and because several
+stages have too few test occurrences for a trustworthy per-horizon AUC. Table 2 makes this
+concrete, using <code>RSSM, encoder unfrozen</code> pooled across all three domains.</p>
+
+<table>
+<caption>Table 2. Per-stage forecasting, pooled, derived/&Pi; AUC at k=1 and k=5.</caption>
+<thead><tr><th class="label">Stage</th><th>n positive (k1&rarr;5)</th><th>AUC k=1</th><th>AUC k=5</th></tr></thead>
+<tbody>
+<tr><td class="label">Benign</td><td>711 &rarr; 731</td><td>0.960</td><td>0.951</td></tr>
+<tr><td class="label">Command and Control</td><td>989 &rarr; 977</td><td><b>0.987</b></td><td><b>0.974</b></td></tr>
+<tr><td class="label">Initial Access</td><td>17 &rarr; 13 (small)</td><td>0.979</td><td>0.999</td></tr>
+<tr><td class="label">Lateral Movement</td><td>14 &rarr; 10 (small)</td><td>0.947</td><td>0.903</td></tr>
+<tr><td class="label">Impact</td><td>5 &rarr; 5 (not trustworthy)</td><td>1.000</td><td>1.000</td></tr>
+<tr><td class="label">Reconnaissance</td><td>0 everywhere</td><td colspan="2">insufficient test occurrences</td></tr>
+<tr><td class="label">Exfiltration</td><td>0 everywhere</td><td colspan="2">insufficient test occurrences</td></tr>
+</tbody>
+</table>
+<p>Command-and-Control forecasting is the one genuinely large-sample, statistically solid result
+across every domain. Reconnaissance and Exfiltration cannot be forecast at all with the current
+data: there are zero test windows anywhere that transition into either stage within any
+5-minute horizon &mdash; a data-scarcity floor, not an architecture limitation.</p>
+</section>
+
+<section>
+<h2>6. Baselines and the Cross-Episode Generalization Test</h2>
+<h3>6.1 The logistic-regression baseline</h3>
+<p>A per-horizon logistic regression (five separate binary models, one per forecast horizon,
+trained on the flattened context window, class-weight balanced) was built as the mandated
+baseline and given every fair chance. For most of the architecture search, it was competitive
+with or dominant over the world model &mdash; a result reported honestly throughout rather than
+minimized, and the single strongest signal that architectural complexity was not obviously
+buying its keep until the final <code>RSSM unfrozen</code> configuration.</p>
+
+<h3>6.2 The memorization check</h3>
+<p>CIC-IDS-2018 contains exactly two Infiltration episodes (Wednesday-28-02-2018 and
+Thursday-01-03-2018, both mapped to Lateral Movement). Every LR number reported elsewhere in this
+project was obtained by pooling windows from <i>all</i> days (including both infiltration days)
+and testing on a later time slice of those same days &mdash; meaning the model had already
+partially seen the episode it was evaluated on. A true <b>episode-level</b> holdout (train the LR
+purely on one day, test purely on the other, never mixed) tells a very different story:</p>
+
+<table>
+<caption>Table 3. True cross-episode holdout, logistic regression.</caption>
+<thead><tr><th class="label">Direction</th><th>Brier (k1&rarr;5)</th><th>AUC (k1&rarr;5)</th></tr></thead>
+<tbody>
+<tr><td class="label">Train Wed-28 &rarr; Test Thu-01</td><td>0.182 &rarr; 0.220</td><td>0.792 &rarr; 0.824</td></tr>
+<tr><td class="label">Train Thu-01 &rarr; Test Wed-28</td><td class="bad">0.584 &rarr; 0.594</td><td>0.676 &rarr; 0.742</td></tr>
+</tbody>
+</table>
+<p>AUC collapses from the reported &asymp;0.995 (within-episode) to 0.68&ndash;0.82 (true
+holdout) &mdash; a substantial drop, though not to chance, meaning LR does learn some genuinely
+transferable signal, just far less than the in-distribution number suggested. The
+Thursday&rarr;Wednesday direction is worse than <i>useless</i> on Brier (0.58, worse than
+predicting the constant base rate), even though its AUC ranking is still reasonably above random
+&mdash; a real dissociation between ranking quality and calibration trustworthiness.</p>
+<p>The same test on the world model (<code>RSSM unfrozen</code>, trained on everything <i>except</i>
+the held-out day) shows AUC 0.72&ndash;0.82 across both directions and, critically, <b>never</b>
+the catastrophic Brier failure LR showed in one direction (Brier stays 0.21&ndash;0.31 both ways).
+Neither method has a decisive AUC edge on a genuinely unseen episode; the real differentiator is
+calibration stability, not ranking accuracy &mdash; a materially more honest and more useful claim
+for a predictive-defence system than &ldquo;the model beats the baseline.&rdquo;</p>
+</section>
+
+<section>
+<h2>7. Explainability</h2>
+<h3>7.1 Attention and &Pi;</h3>
+<p>Attention weights are read directly off the Transformer's own computation, not a post-hoc
+approximation, when that backbone is used &mdash; but reading an attention weight off a model
+is not, on its own, a guarantee that the weight is a <i>faithful</i> explanation of the model's
+actual computation (a well-documented general limitation of attention-as-explanation in the
+interpretability literature); it is offered here as a diagnostic signal, not a certified
+causal account. The &Pi; transition matrix is directly interpretable by construction &mdash;
+every entry is a literal, counted transition probability, and the K-step forecast is a matrix
+power, not a learned function &mdash; subject to the scope stated in Section&nbsp;2.2 (it is
+counted over the simplified single-stage-per-window label, not native ATT&amp;CK ground
+truth).</p>
+<h3>7.2 SHAP</h3>
+<p>A <code>KernelExplainer</code> wraps the model's stage-classification output (holding the
+fixed prior context and perturbing only the most recent window's 43 raw features) and explains,
+per window, which features drove the <b>current, single-window</b> stage call. <b>This is
+explicitly not the same claim as explaining a multi-step (k=1..5) forecast rollout</b> &mdash;
+no SHAP attribution is computed against the rollout's own output, and none is claimed to exist
+here; extending this to a genuine multi-step-rollout explanation is a stated open item, not an
+implicit claim of this report. Two consistent, load-bearing findings about the single-window
+explanation that <i>is</i> computed:</p>
+<ul>
+<li><b>SHAP magnitude tracks decision-boundary proximity, not a fixed scale.</b> On
+confidently-Benign windows, attributions are tiny (&sim;0.0001&ndash;0.0005) because the softmax
+has little room to move; during a real, live-tested Lateral Movement attack, attributions grow
+roughly 30&ndash;100&times; larger (&sim;0.004&ndash;0.016), correctly reflecting that the model
+is actually near a decision boundary.</li>
+<li><b>Validated against a genuine attack in real time.</b> Replaying the actual
+Wednesday-28-02-2018 attack window-by-window (Section&nbsp;8) showed infiltration probability
+climbing <i>one window before</i> the ground-truth label flipped to Lateral Movement
+(0.61&ndash;0.67 at the window immediately prior), then the stage classification itself correctly
+flipping to Lateral Movement at the true transition window and staying correct for the sustained
+18-window attack duration, with SHAP consistently attributing the call to
+<code>svc_smtp_frac</code>, <code>svc_ssh_frac</code>, <code>half_open_frac</code>, and
+<code>bwd_pkts_mean</code>.</li>
+</ul>
+</section>
+
+<section>
+<h2>8. Working Prototype</h2>
+<dl class="desc">
+<dt>A replay dashboard</dt>
+<dd>Visualizes the model's <i>saved</i> predictions over a real attack day as an animated
+MITRE-stage strip, an infiltration-probability forecast chart, a scrubbable timeline, and
+per-window SHAP bars. Useful for demonstration and inspection, but &mdash; stated plainly in its
+own footer &mdash; it is a report of precomputed output, not a live tool.</dd>
+<dt>A live-inference server (the actual PS deliverable)</dt>
+<dd>A Flask backend (<code>server.py</code>) loads the trained model once at startup and exposes
+two endpoints: <code>POST /api/analyze</code> accepts an uploaded CSV (43-feature schema) or a
+raw PCAP file, extracts windows (with genuine packet-level TTL/fragmentation/payload-size
+features when given a PCAP, computed from real packets rather than zero-filled), and runs the
+world model <i>live</i> to return a forecast and stage classification for every window;
+<code>POST /api/explain</code> computes a SHAP explanation for one specific window on demand, so
+a full KernelExplainer pass is never paid for windows the user never looks at. A browser
+dashboard (drag-and-drop upload, or one-click real sample buttons for the two genuine
+CIC-IDS-2018 attack days) drives this API and renders the same visual language as the replay
+dashboard, but every number on screen was computed by the model for that specific input at
+request time.</dd>
+</dl>
+</section>
+
+<section>
+<h2>9. Known Limitations</h2>
+<p>Reported plainly, as an inventory of open problems rather than a list of excuses:</p>
+<ul>
+<li><b>Reconnaissance and Exfiltration are unforecastable and (Reconnaissance) barely
+classifiable with current data</b> &mdash; 12 total training examples for Reconnaissance, zero
+Exfiltration examples anywhere in the pooled corpus. No architecture change fixes a class the
+data does not contain.</li>
+<li><b>CTU-13's host-graph forecasting (G-RSSM) remains broken</b> after fixing the node-identity
+bug; a second, distinct issue (likely host-selection criterion) is unresolved.</li>
+<li><b>CICIoT2023 could not be integrated</b>: its public release has no timestamps and
+pre-shuffles packets into fixed-size groups, incompatible with time-windowed sequence
+forecasting at the source-format level, not a preprocessing choice.</li>
+<li><b>The strongest single result (RSSM unfrozen + DANN) has an unreplicated headline claim.</b>
+Its domain-generalization recovery on CIC-IDS-2017 held on one seed and failed on a second; only
+the plain <code>RSSM, encoder unfrozen</code> configuration (without DANN) has fully replicated
+numbers across the seeds actually run.</li>
+<li><b>Packet-level PCAPs for CIC-IDS-2018/2017 were not downloaded</b> (~220&nbsp;GB);
+packet-level features (TTL, fragmentation, retransmission, payload-size variance) are
+zero-filled for those two datasets in the training pipeline.</li>
+<li><b>The live-PCAP inference path has an unmeasured train-serving distribution mismatch.</b>
+When the live demo is given a real PCAP, those same packet-level fields are populated with
+genuine, non-zero values computed from real packets &mdash; values the model never observed
+during training on the two zero-filled datasets (roughly two-thirds of the pooled training
+corpus by day count). Whether this shift degrades reliability has not been measured (e.g. via a
+held-out comparison of the model's calibration on zero-filled vs. genuinely-populated
+packet-level inputs); the live demo's few qualitative test runs are not a substitute for that
+measurement, and it should be treated as open rather than assumed benign.</li>
+</ul>
+</section>
+
+<section>
+<h2>10. Conclusion</h2>
+<p>The system addresses the problem statement's core requirements, within the scope this report
+states explicitly rather than implies: a latent-transition model (not a static classifier) built
+from a self-supervised dynamics objective supports downstream forecasting of attacker
+progression several minutes ahead and 7-way stage classification, maps predictions onto a
+MITRE-ATT&amp;CK-derived taxonomy whose construction is documented in Section&nbsp;2.2 rather
+than left implicit, and exposes two explanation channels (attention/&Pi; and single-window
+SHAP) whose claim boundaries are stated in Section&nbsp;7. The one result that should be
+treated as the project's actual generalization claim is the cross-episode holdout
+(Section&nbsp;6, AUC &asymp; 0.68&ndash;0.82 on two held-out episodes) &mdash; modest, above
+chance, and honestly small-sample. The strongest configuration on the (separately reported,
+in-distribution) pooled metrics, <code>RSSM with an unfrozen encoder</code>, replicates across
+five seeds on those metrics, but that result describes the two downstream heads measured, not
+an independently verified improvement in the dynamics model itself (Section&nbsp;3.4). Equally
+important to the project's credibility is what is reported <i>without</i> spin: a plain logistic
+regression was competitive for most of the search, a dedicated infiltration head made things
+worse, two graph-encoder attempts each failed in different, diagnosable ways, one headline
+result (DANN's domain-generalization recovery) did not survive a second seed, several stage
+classes have too little test support for a confident claim, and the true cross-episode
+generalization ceiling is substantially lower than the in-distribution numbers on their own
+would imply. Every one of these negative or qualified findings was investigated to a specific,
+verifiable cause rather than smoothed over &mdash; which is, together with the working
+live-inference prototype, the actual contribution of this project.</p>
+</section>
+
+<section>
+<h2>Reproducibility</h2>
+<p>Provided here, stated honestly against what is <b>not</b> provided (this report is not a
+sealed reproducibility package):</p>
+<ul>
+<li><b>Provided:</b> context length 16 windows, forecast horizon 5 windows; Phase&nbsp;1
+(dynamics) trained 30 epochs, Phase&nbsp;2 (heads) 20 epochs, AdamW, weight decay 1e-4, learning
+rate 3e-4 (Phase&nbsp;1) / 1e-3 (Phase&nbsp;2), gradient clipped to norm 1.0; RSSM dimensions
+d<sub>h</sub>=32, d<sub>z</sub>=16, d<sub>embed</sub>=64; free-bits KL floor of 1 nat per
+direction (DreamerV3's exact balanced free-bits formulation); temporal train/val/test split
+70/15/15 per source file, never crossing a day/scenario boundary; the five-seed replication of
+<code>RSSM, encoder unfrozen</code> reported in Section&nbsp;4 used five independent
+Phase-1+Phase-2 training runs with no fixed random seed (relying on run-to-run variance itself,
+not a chosen seed list) and its full per-seed metrics.</li>
+<li><b>Not provided:</b> exact train/val/test split manifests (row-level file lists),
+checkpoint file hashes, a frozen/sealed test protocol, or dataset-preprocessing content hashes.
+Reproducing the headline table from this report alone would require re-running the described
+pipeline against the same public dataset releases and accepting the same run-to-run variance
+documented in Section&nbsp;4, not a byte-identical replay.</li>
+</ul>
+</section>
+
+<section>
+<h2>References</h2>
+<ol>
+<li>Hafner, D., Pasukonis, J., Ba, J., &amp; Lillicrap, T. (2023). <i>Mastering Diverse Domains
+through World Models.</i> arXiv:2301.04104. (DreamerV3; source of the exact balanced free-bits
+KL formulation used throughout this project's RSSM variants.)</li>
+<li>Ganin, Y., &amp; Lempitsky, V. (2015). <i>Unsupervised Domain Adaptation by
+Backpropagation.</i> Proceedings of ICML 2015. (Gradient Reversal Layer / domain-adversarial
+training, Section&nbsp;4.1.)</li>
+<li>Schlichtkrull, M., Kipf, T. N., Bloem, P., van den Berg, R., Titov, I., &amp; Welling, M.
+(2018). <i>Modeling Relational Data with Graph Convolutional Networks.</i> ESWC 2018.
+(Relational GCN formulation underlying the feature-level graph encoder, Section&nbsp;4.2.)</li>
+<li>AAAI'26 GraFT paper (<a href="https://ojs.aaai.org/index.php/AAAI/article/view/40029">ojs.aaai.org/index.php/AAAI/article/view/40029</a>)
+&mdash; motivating reference for the feature-level relational graph encoder design.</li>
+<li>Karacelebi, C., Sahin, Y. T., Surer, E., &amp; Onur, E. <i>Learning Ad Hoc Network Dynamics
+via Graph-Structured World Models.</i> arXiv:2604.14811. (G-RSSM; per-host latent-state,
+cross-host-attention design underlying the host-communication graph encoder,
+Section&nbsp;4.2.)</li>
+<li>Sharafaldin, I., Lashkari, A. H., &amp; Ghorbani, A. A. (2018). <i>Toward Generating a New
+Intrusion Detection Dataset and Intrusion Traffic Characterization.</i> ICISSP 2018.
+(CIC-IDS-2018/2017, Canadian Institute for Cybersecurity.)</li>
+<li>Garcia, S., Grill, M., Stiborek, J., &amp; Zunino, A. (2014). <i>An Empirical Comparison of
+Botnet Detection Methods.</i> Computers &amp; Security, 45, 100&ndash;123. (CTU-13,
+Stratosphere IPS Laboratory.)</li>
+</ol>
+</section>
+
+</body>
+</html>
